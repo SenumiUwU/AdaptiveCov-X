@@ -1,0 +1,20 @@
+# Local input snapshots and experiment outputs
+/data/
+/results/
+/results_*/
+
+# Python tooling and temporary files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+*.bak
+*.log
+
+# Local credential files
+.netrc
+.pypirc
+credentials.*
+secrets.*
+*.pem
+*.key

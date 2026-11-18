@@ -2,21 +2,29 @@
 
 AdaptiveCov-X is a research and implementation project focused on adaptive covariance estimation and portfolio optimization.
 
-## Project structure
+## Original notebook implementation
 
-- `data/raw/` — raw datasets
-- `data/processed/` — cleaned and transformed data
-- `notebooks/` — exploratory notebooks and analysis
-- `src/data/` — data loading and preprocessing modules
-- `src/covariance/` — covariance estimation implementations
-- `src/portfolio/` — portfolio construction and optimization logic
-- `src/features/` — feature engineering utilities
-- `results/` — generated outputs, reports, and plots
+[`notebooks/01_data_collection.ipynb`](notebooks/01_data_collection.ipynb) contains the earlier Yahoo Finance data collection, covariance diagnostics, minimum-variance portfolios, and exploratory rule-based and neural routing experiments. The original raw data is under `data/raw/`, and the saved outputs are under `notebooks/`.
 
-## Getting started
+## Ridge and PyTorch routing proof of concept
 
-1. Add datasets to `data/raw/`.
-2. Build preprocessing scripts under `src/data/`.
-3. Implement covariance estimators in `src/covariance/`.
-4. Add optimization strategies in `src/portfolio/`.
-5. Save reports and visualizations in `results/`.
+[`neural_router_poc/`](neural_router_poc/) runs a standalone experiment on nine US sector ETFs. Ridge and a compact PyTorch MLP (56 → 16 → 8 → 3) predict the next 21 trading days' realised log variance for the Historical, EWMA, and Ledoit–Wolf experts. Softmax turns the negative forecasts into covariance blend weights. A separate long-only global minimum variance optimiser computes the portfolio. The seven-strategy comparison uses a 252-trading-day covariance lookback, 21-trading-day rebalancing, and a 10 bps one-way transaction cost.
+
+### Run the PoC
+
+The PoC was tested with Python 3.13 and CPU PyTorch. Its [requirements](neural_router_poc/requirements.txt) also include NumPy, pandas, SciPy, scikit-learn, Matplotlib, and yfinance. Create a virtual environment from the repository root:
+
+```powershell
+cd neural_router_poc
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe run_poc.py --demo
+.\.venv\Scripts\python.exe run_poc.py --yahoo
+```
+
+On macOS or Linux, use `python3 -m venv .venv` and `./.venv/bin/python` for the same commands. The synthetic demo writes `results_synthetic/viva_dashboard.html`. A successful Yahoo run writes `results_yahoo/viva_dashboard.html` and an audited price snapshot under `neural_router_poc/data/`. To reuse the snapshot, run `run_poc.py --csv data/real_prices.csv` with the same Python interpreter.
+
+### Current limitations
+
+The routers are supervised risk forecasters, with portfolio optimisation downstream. The experiment uses one chronological holdout per dataset, a fixed ETF universe, and the assumption that fills occur at the preceding close. Treat synthetic results as pipeline verification and historical results as one empirical comparison. Yahoo availability and revisions can affect reproducibility. See the [PoC documentation](neural_router_poc/README.md) for the split, input schema, and outputs.
