@@ -1,8 +1,8 @@
 """AdaptiveCov-X: small, reproducible, leakage-aware research proof of concept.
 
 Usage: python run_poc.py --yahoo
-       python run_poc.py --csv data/real_prices.csv
-       python run_poc.py --demo
+       python run_poc.py --csv data/real_prices.csv --ablation
+       python run_poc.py --demo --feature-set expanded58
 
 The supplied demo is SYNTHETIC. It is not evidence of real-market performance.
 """
@@ -13,7 +13,9 @@ import base64
 import html
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from importlib.metadata import version
 from pathlib import Path
 
 import matplotlib
@@ -32,9 +34,31 @@ SECTORS = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"]
 EXPERTS = ["Historical", "EWMA", "Ledoit-Wolf"]
 ROUTERS = ("Ridge", "Neural MLP")
 LOOKBACK, REBALANCE, TRADING_DAYS, COST_BPS = 252, 21, 252, 10
+MARKET_WINDOW, VIX_CHANGE_DAYS = 21, 5
 EWMA_LAMBDA = 0.94
 STATIC_ROUTER = np.array([0.35, 0.20, 0.45])
 COLORS = ["#2864a1", "#d69a27", "#298c78", "#8554ad", "#cb5f4e", "#7d8795", "#131d33"]
+DEFAULT_FEATURE_SET = "expanded58"
+UPPER_TRIANGLE = np.triu_indices(len(SECTORS))
+EXPANDED_FEATURE_NAMES = (
+    "vix_lagged_level", "vix_5d_change", "spy_21d_annualized_volatility", "spy_21d_return",
+    *(f"{ticker}_21d_daily_volatility_pct" for ticker in SECTORS),
+    *(f"{SECTORS[i]}_{SECTORS[j]}_21d_covariance_x10000" for i, j in zip(*UPPER_TRIANGLE)),
+)
+_ABLATION_EXCLUSIONS = {
+    "legacy56": {"vix_5d_change", "spy_21d_return"},
+    "vix57": {"spy_21d_return"},
+    "spy57": {"vix_5d_change"},
+    "expanded58": set(),
+}
+FEATURE_NAMES = {
+    name: tuple(feature for feature in EXPANDED_FEATURE_NAMES if feature not in excluded)
+    for name, excluded in _ABLATION_EXCLUSIONS.items()
+}
+_FEATURE_COLUMNS = {
+    name: [EXPANDED_FEATURE_NAMES.index(feature) for feature in features]
+    for name, features in FEATURE_NAMES.items()
+}
 
 
 @dataclass
@@ -83,7 +107,7 @@ def make_synthetic_csv(path: Path, days: int = 2520, seed: int = 42) -> None:
     df.to_csv(path, index=False, float_format="%.8f")
 
 
-def load_prices(path: Path) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
+def load_prices(path: Path | io.BytesIO) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
     df = pd.read_csv(path, parse_dates=["Date"])
     required = ["Date", *SECTORS, "SPY", "VIX"]
     missing = [x for x in required if x not in df.columns]
@@ -153,19 +177,35 @@ def _hold_returns(period: np.ndarray, starting_weights: np.ndarray) -> tuple[np.
     return out, w
 
 
-def build_samples(dates: pd.DatetimeIndex, r: np.ndarray, spy: np.ndarray, vix: np.ndarray) -> list[Sample]:
+def _vix_5d_change(vix: np.ndarray, t: int) -> float:
+    if t <= VIX_CHANGE_DAYS or t > len(vix):
+        raise ValueError("VIX change requires six observations before the rebalance.")
+    denominator = float(vix[t - 1 - VIX_CHANGE_DAYS])
+    if not np.isfinite(denominator) or denominator <= 0:
+        raise ValueError("VIX change denominator must be a positive, finite index level.")
+    return float(vix[t - 1]) / denominator - 1.0
+
+
+def build_samples(dates: pd.DatetimeIndex, r: np.ndarray, spy: np.ndarray, vix: np.ndarray,
+                  feature_set: str = DEFAULT_FEATURE_SET) -> list[Sample]:
     samples = []
-    ix = np.triu_indices(len(SECTORS))
+    columns = _FEATURE_COLUMNS[feature_set]
     for t in range(LOOKBACK, len(r) - REBALANCE + 1, REBALANCE):
         lookback = r[t - LOOKBACK:t]
-        recent = r[t - REBALANCE:t]
-        recent_spy = spy[t - REBALANCE:t]
+        recent = r[t - MARKET_WINDOW:t]
+        recent_spy = spy[t - MARKET_WINDOW:t]
+        if len(recent_spy) != MARKET_WINDOW:
+            raise ValueError(f"SPY features require {MARKET_WINDOW} observations before the rebalance.")
         recent_cov = np.cov(recent, rowvar=False, ddof=1)
         spy_vol = float(np.std(recent_spy, ddof=1) * np.sqrt(TRADING_DAYS))
+        spy_return = np.prod(1.0 + recent_spy) - 1.0
         daily_vols = np.std(recent, axis=0, ddof=1)
-        # Lagged market state: VIX, SPY 21d vol, marginal vols and lagged RCM.
-        feature = np.r_[vix[t - 1], spy_vol, daily_vols * 100,
-                        recent_cov[ix] * 1e4]
+        vix_change = _vix_5d_change(vix, t)
+        expanded = np.r_[vix[t - 1], vix_change, spy_vol, spy_return, daily_vols * 100,
+                         recent_cov[UPPER_TRIANGLE] * 1e4]
+        if not np.isfinite(expanded).all():
+            raise ValueError(f"Non-finite market features at rebalance {dates[t].date()}.")
+        feature = expanded[columns]
         covs = covariance_experts(lookback)
         expert_w = np.stack([gmv_weights(c) for c in covs])
         future = r[t:t + REBALANCE]
@@ -342,35 +382,60 @@ h1{{margin:0;font-size:32px}}.sub{{opacity:.75;margin:8px 0 0}}.tag{{display:inl
     (output / "viva_dashboard.html").write_text(markup, encoding="utf-8")
 
 
-def run(csv_path: Path, out: Path, synthetic: bool, source_metadata: dict | None = None):
+def _load_experiment(csv_path: Path, synthetic: bool, source_metadata: dict | None):
+    csv_path = Path(csv_path)
+    snapshot = csv_path.read_bytes()
+    digest = sha256(snapshot).hexdigest()
+    if source_metadata is None and not synthetic:
+        audit = csv_path.with_name("yahoo_download_metadata.json")
+        if audit.exists():
+            candidate = json.loads(audit.read_text(encoding="utf-8"))
+            if candidate.get("data_sha256") == digest:
+                source_metadata = candidate
+    if source_metadata is not None and source_metadata.get("data_sha256") != digest:
+        raise ValueError("Yahoo download metadata does not match the input CSV SHA-256.")
+    dates, asset_returns, spy_returns, vix = load_prices(io.BytesIO(snapshot))
+    samples = build_samples(dates, asset_returns, spy_returns, vix, DEFAULT_FEATURE_SET)
+    data_kind = "synthetic" if synthetic else "Yahoo Finance historical data" if source_metadata else "user-supplied price CSV"
+    meta = {"data_kind": data_kind, "source_csv": str(csv_path), "data_sha256": digest}
+    if source_metadata:
+        meta["yahoo_source_metadata"] = source_metadata
+    return dates, samples, meta
+
+
+def _run_feature_set(dates: pd.DatetimeIndex, samples: list[Sample], out: Path,
+                     source_meta: dict, feature_set: str):
     from neural_router import HIDDEN_WIDTHS, fit_neural_router
     from torch import __version__ as torch_version
 
     out.mkdir(parents=True, exist_ok=True)
-    dates, asset_returns, spy_returns, vix = load_prices(csv_path)
-    samples = build_samples(dates, asset_returns, spy_returns, vix)
+    if feature_set != DEFAULT_FEATURE_SET:
+        columns = _FEATURE_COLUMNS[feature_set]
+        samples = [replace(sample, features=sample.features[columns]) for sample in samples]
     train, validation, test = split_samples(samples)
     temperatures = (.35, .75, 1.5)
+    alphas = (1., 10., 100.)
     ridge_candidates = []
-    for alpha in (1., 10., 100.):
+    for alpha in alphas:
         model = fit_router(train, alpha)
         for temp in temperatures:
             metrics, _, _ = evaluate(validation, "Ridge", model, temp)
             ridge_candidates.append((metrics["Ann. volatility"], alpha, temp, model))
-    _, best_alpha, ridge_temp, ridge = min(ridge_candidates, key=lambda candidate: candidate[:3])
+    ridge_val_vol, best_alpha, ridge_temp, ridge = min(ridge_candidates, key=lambda candidate: candidate[:3])
 
+    val_features = np.stack([s.features for s in validation])
+    val_targets = np.stack([s.target_log_vars for s in validation])
     neural_config = {"seed": 42, "learning_rate": .003, "weight_decay": .01,
                      "max_epochs": 300, "patience": 25}
     neural = fit_neural_router(
         np.stack([s.features for s in train]), np.stack([s.target_log_vars for s in train]),
-        np.stack([s.features for s in validation]), np.stack([s.target_log_vars for s in validation]),
-        **neural_config,
+        val_features, val_targets, **neural_config,
     )
     neural_candidates = []
     for temp in temperatures:
         metrics, _, _ = evaluate(validation, "Neural MLP", neural, temp)
         neural_candidates.append((metrics["Ann. volatility"], temp))
-    _, neural_temp = min(neural_candidates)
+    neural_val_vol, neural_temp = min(neural_candidates)
     models = {"Ridge": (ridge, ridge_temp), "Neural MLP": (neural, neural_temp)}
 
     strategies = [*EXPERTS, "Static Blend", "Equal Weight", *ROUTERS]
@@ -390,41 +455,79 @@ def run(csv_path: Path, out: Path, synthetic: bool, source_metadata: dict | None
     weights = pd.concat(all_weights, ignore_index=True)
     test_features = np.stack([s.features for s in test])
     test_targets = np.stack([s.target_log_vars for s in test])
-    meta = {"data_kind": "synthetic" if synthetic else ("Yahoo Finance historical data" if source_metadata else "user-supplied price CSV"),
-            "source_csv": str(csv_path), "nine_etfs": SECTORS,
+    meta = {**source_meta, "nine_etfs": SECTORS, "experts": EXPERTS,
+            "feature_set": feature_set, "feature_names": FEATURE_NAMES[feature_set],
             "lookback_days": LOOKBACK, "rebalance_days": REBALANCE,
-            "cost_bps": COST_BPS, "ewma_lambda": EWMA_LAMBDA,
+            "cost_bps": COST_BPS, "cost_convention": "one-way on half-L1 turnover, initial turnover 1",
+            "portfolio_constraints": "long-only, fully invested GMV",
+            "annualization_days": TRADING_DAYS, "ewma_lambda": EWMA_LAMBDA,
+            "market_window_days": MARKET_WINDOW, "vix_change_days": VIX_CHANGE_DAYS,
             "train_validation_test_split": "chronological 60/20/20",
+            "ridge_alpha_grid": alphas, "softmax_temperature_grid": temperatures,
             "ridge_alpha_selected_on_validation": best_alpha,
             "softmax_temperature_selected_on_validation": ridge_temp,
             "neural_mlp": {**neural_config,
+                           "optimizer": "AdamW", "loss": "MSE", "activation": "ReLU",
                            "torch_version": torch_version,
                            "widths": [train[0].features.size, *HIDDEN_WIDTHS, len(EXPERTS)],
                            "best_epoch": neural.best_epoch, "epochs_trained": neural.epochs_trained,
                            "validation_log_variance_mse": neural.validation_mse,
                            "softmax_temperature_selected_on_validation": neural_temp},
+            "library_versions": {name: version(name) for name in ("numpy", "pandas", "scipy", "scikit-learn")},
+            "validation_log_variance_mse": {
+                "Ridge": float(np.mean((ridge.predict(val_features) - val_targets) ** 2)),
+                "Neural MLP": neural.validation_mse},
+            "validation_net_annualized_volatility": {"Ridge": ridge_val_vol, "Neural MLP": neural_val_vol},
             "test_log_variance_mse": {name: float(np.mean((model.predict(test_features) - test_targets) ** 2))
                                       for name, (model, _) in models.items()},
             "first_test_date": str(test[0].date.date()),
             "last_test_date": str(dates[test[-1].end - 1].date()),
             "training_dates": [str(s.date.date()) for s in train],
             "validation_dates": [str(s.date.date()) for s in validation],
-            "test_dates": [str(s.date.date()) for s in test]}
-    if source_metadata:
-        meta["yahoo_source_metadata"] = source_metadata
+            "test_dates": [str(s.date.date()) for s in test],
+            "last_label_dates": {name: str(dates[split[-1].end - 1].date())
+                                 for name, split in zip(("training", "validation", "test"),
+                                                        (train, validation, test))}}
     metrics.to_csv(out / "test_metrics.csv", float_format="%.9f")
     wide_returns.to_csv(out / "test_daily_returns.csv", float_format="%.9f")
     weights.to_csv(out / "test_rebalance_weights.csv", index=False, float_format="%.9f")
     (out / "run_metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    make_report(out, metrics, wide_returns, weights, meta, synthetic)
-    print("\nAdaptiveCov-X PoC COMPLETED | " + ("SYNTHETIC demo" if synthetic else "YAHOO FINANCE prices" if source_metadata else "USER-SUPPLIED CSV prices"))
+    make_report(out, metrics, wide_returns, weights, meta, meta["data_kind"] == "synthetic")
+    print(f"\nAdaptiveCov-X PoC COMPLETED | {meta['data_kind']} | {feature_set}")
     print("Test:", meta["first_test_date"], "to", meta["last_test_date"])
     print("Train/val/test windows:", len(train), len(validation), len(test))
     print("Selected Ridge alpha, softmax temp:", best_alpha, ridge_temp)
     print("Selected MLP epoch, softmax temp:", neural.best_epoch, neural_temp)
     print(metrics.to_string(float_format=lambda x: f"{x:.4f}"))
     print("\nOpen:", out / "viva_dashboard.html")
+    return metrics, weights, meta
+
+
+def run(csv_path: Path, out: Path, synthetic: bool, source_metadata: dict | None = None,
+        *, feature_set: str = DEFAULT_FEATURE_SET):
+    dates, samples, source_meta = _load_experiment(csv_path, synthetic, source_metadata)
+    metrics, _, meta = _run_feature_set(dates, samples, out, source_meta, feature_set)
     return metrics, meta
+
+
+def _run_ablation(dates: pd.DatetimeIndex, samples: list[Sample], out: Path, source_meta: dict):
+    comparison, runs = [], {}
+    for feature_set, names in FEATURE_NAMES.items():
+        metrics, weights, meta = _run_feature_set(dates, samples, out / feature_set, source_meta, feature_set)
+        runs[feature_set] = meta
+        for strategy in ROUTERS:
+            expert_weights = weights.loc[weights.Strategy == strategy, [f"Weight_{e}" for e in EXPERTS]]
+            comparison.append({
+                "Data kind": meta["data_kind"], "Source SHA-256": meta["data_sha256"],
+                "Feature set": feature_set, "Features": len(names), "Strategy": strategy,
+                "Validation log-variance MSE": meta["validation_log_variance_mse"][strategy],
+                "Test log-variance MSE": meta["test_log_variance_mse"][strategy],
+                **metrics.loc[strategy].to_dict(),
+                **{f"Mean weight {e}": expert_weights[f"Weight_{e}"].mean() for e in EXPERTS},
+                **{f"Weight std {e}": expert_weights[f"Weight_{e}"].std(ddof=0) for e in EXPERTS},
+            })
+    pd.DataFrame(comparison).to_csv(out / "feature_ablation_comparison.csv", index=False, float_format="%.9f")
+    (out / "feature_ablation_metadata.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
 
 
 def main():
@@ -433,6 +536,10 @@ def main():
     inputs.add_argument("--demo", action="store_true", help="Run the clearly labelled synthetic market demo")
     inputs.add_argument("--yahoo", action="store_true", help="Download real Yahoo Finance prices (requires internet + yfinance)")
     inputs.add_argument("--csv", type=Path, help="Path to REAL adjusted-close price CSV with SPY and VIX")
+    features = ap.add_mutually_exclusive_group()
+    features.add_argument("--feature-set", choices=FEATURE_NAMES, default=DEFAULT_FEATURE_SET,
+                          help=f"Router input schema (default: {DEFAULT_FEATURE_SET})")
+    features.add_argument("--ablation", action="store_true", help="Compare all four input schemas on one snapshot")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--yahoo-start", default="2014-01-01")
     ap.add_argument("--yahoo-end-exclusive", default="2026-11-12",
@@ -450,15 +557,13 @@ def main():
             output=Path("data/real_prices.csv"))
     else:
         csv_path = args.csv
-        # Preserve provenance only when its recorded CSV hash matches.
-        from hashlib import sha256
-        audit = Path(csv_path).parent / "yahoo_download_metadata.json"
-        if audit.exists():
-            candidate = json.loads(audit.read_text(encoding="utf-8"))
-            if candidate.get("data_sha256") == sha256(Path(csv_path).read_bytes()).hexdigest():
-                source_metadata = candidate
-    out = args.out or Path("results_synthetic" if args.demo else "results_yahoo" if source_metadata else "results_csv")
-    run(csv_path, out, synthetic=args.demo, source_metadata=source_metadata)
+    dates, samples, source_meta = _load_experiment(csv_path, args.demo, source_metadata)
+    default_out = Path("results_synthetic" if args.demo else
+                       "results_yahoo" if "yahoo_source_metadata" in source_meta else "results_csv")
+    if args.ablation:
+        _run_ablation(dates, samples, args.out or default_out.with_name(default_out.name + "_ablation"), source_meta)
+    else:
+        _run_feature_set(dates, samples, args.out or default_out, source_meta, args.feature_set)
 
 
 if __name__ == "__main__":
