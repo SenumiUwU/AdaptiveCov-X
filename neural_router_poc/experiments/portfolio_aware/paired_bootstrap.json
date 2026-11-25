@@ -1,0 +1,53 @@
+[
+  {
+    "alternative": "Neural MLP",
+    "reference": "Supervised MLP (56)",
+    "days": 609,
+    "annualized_volatility_difference_bps": 2.6508657675351497,
+    "ci95_bps": [
+      -8.015075110553672,
+      13.436287988270927
+    ],
+    "ci_excludes_zero": false,
+    "materiality_threshold_bps": 10.0,
+    "point_meets_improvement_threshold": false,
+    "ci_supports_material_improvement": false,
+    "block_length": 21,
+    "resamples": 10000,
+    "seed": 42
+  },
+  {
+    "alternative": "Portfolio-Aware MLP",
+    "reference": "Neural MLP",
+    "days": 609,
+    "annualized_volatility_difference_bps": -1.5044339647810137,
+    "ci95_bps": [
+      -10.74037334916178,
+      8.75859801071404
+    ],
+    "ci_excludes_zero": false,
+    "materiality_threshold_bps": 10.0,
+    "point_meets_improvement_threshold": false,
+    "ci_supports_material_improvement": false,
+    "block_length": 21,
+    "resamples": 10000,
+    "seed": 42
+  },
+  {
+    "alternative": "Portfolio-Aware MLP + Turnover",
+    "reference": "Portfolio-Aware MLP",
+    "days": 609,
+    "annualized_volatility_difference_bps": -0.023192077502442607,
+    "ci95_bps": [
+      -5.390308613794718,
+      5.8439576929174955
+    ],
+    "ci_excludes_zero": false,
+    "materiality_threshold_bps": 10.0,
+    "point_meets_improvement_threshold": false,
+    "ci_supports_material_improvement": false,
+    "block_length": 21,
+    "resamples": 10000,
+    "seed": 42
+  }
+]
