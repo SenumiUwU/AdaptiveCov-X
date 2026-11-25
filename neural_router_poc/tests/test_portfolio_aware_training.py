@@ -37,6 +37,7 @@ class PortfolioTrainingTests(unittest.TestCase):
 
     def test_training_uses_portfolio_outcomes_and_returns_checkpoint(self):
         from portfolio_aware_router import PortfolioConfig, fit_portfolio_router
+        from train_portfolio_aware import _evaluate_portfolio
 
         rng = np.random.default_rng(123)
         dates = pd.bdate_range("2020-01-01", periods=420)
@@ -59,6 +60,16 @@ class PortfolioTrainingTests(unittest.TestCase):
         self.assertTrue((weights >= 0).all() and (experts >= 0).all())
         self.assertAlmostEqual(weights.sum(), 1.)
         self.assertAlmostEqual(experts.sum(), 1.)
+        trial = {"config": {}, "best_epoch": fitted.best_epoch, "validation_loss": 0.,
+                 "criterion": "turnover", "warnings": {}}
+        row, daily, allocations = _evaluate_portfolio("seed-test", fitted, trial, dates, [hold])
+        self.assertEqual(row["Strategy"], "seed-test")
+        self.assertEqual(row["Total turnover"], 1.)
+        self.assertEqual(allocations.Strategy.tolist(), ["seed-test"])
+        np.testing.assert_array_equal(daily.index, dates[hold.start:hold.end])
+        expected, _ = _hold_returns(hold.next_returns, weights)
+        expected[0] = (1 - .001) * (1 + expected[0]) - 1
+        np.testing.assert_allclose(daily.to_numpy(), expected)
 
 
 class BootstrapTests(unittest.TestCase):

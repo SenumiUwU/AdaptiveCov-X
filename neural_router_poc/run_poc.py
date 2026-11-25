@@ -33,6 +33,7 @@ from sklearn.preprocessing import StandardScaler
 SECTORS = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"]
 EXPERTS = ["Historical", "EWMA", "Ledoit-Wolf"]
 ROUTERS = ("Ridge", "Neural MLP")
+PORTFOLIO_ROUTERS = ("Portfolio-Aware MLP", "Portfolio-Aware MLP + Turnover")
 LOOKBACK, REBALANCE, TRADING_DAYS, COST_BPS = 252, 21, 252, 10
 MARKET_WINDOW, VIX_CHANGE_DAYS = 21, 5
 EWMA_LAMBDA = 0.94
@@ -247,6 +248,8 @@ def router_probs(model, sample: Sample, temperature: float) -> np.ndarray:
 
 
 def weights_for(strategy: str, sample: Sample, model=None, temperature: float = 1.):
+    if strategy in PORTFOLIO_ROUTERS:
+        return model.allocate(sample.features, sample.covs)
     if strategy == "Equal Weight":
         return np.full(len(SECTORS), 1 / len(SECTORS)), np.array([np.nan] * 3)
     if strategy in EXPERTS:
@@ -500,20 +503,20 @@ def _run_feature_set(dates: pd.DatetimeIndex, samples: list[Sample], out: Path,
     print("Selected MLP epoch, softmax temp:", neural.best_epoch, neural_temp)
     print(metrics.to_string(float_format=lambda x: f"{x:.4f}"))
     print("\nOpen:", out / "viva_dashboard.html")
-    return metrics, weights, meta
+    return metrics, wide_returns, weights, meta
 
 
 def run(csv_path: Path, out: Path, synthetic: bool, source_metadata: dict | None = None,
         *, feature_set: str = DEFAULT_FEATURE_SET):
     dates, samples, source_meta = _load_experiment(csv_path, synthetic, source_metadata)
-    metrics, _, meta = _run_feature_set(dates, samples, out, source_meta, feature_set)
+    metrics, _, _, meta = _run_feature_set(dates, samples, out, source_meta, feature_set)
     return metrics, meta
 
 
 def _run_ablation(dates: pd.DatetimeIndex, samples: list[Sample], out: Path, source_meta: dict):
     comparison, runs = [], {}
     for feature_set, names in FEATURE_NAMES.items():
-        metrics, weights, meta = _run_feature_set(dates, samples, out / feature_set, source_meta, feature_set)
+        metrics, _, weights, meta = _run_feature_set(dates, samples, out / feature_set, source_meta, feature_set)
         runs[feature_set] = meta
         for strategy in ROUTERS:
             expert_weights = weights.loc[weights.Strategy == strategy, [f"Weight_{e}" for e in EXPERTS]]
@@ -540,11 +543,15 @@ def main():
     features.add_argument("--feature-set", choices=FEATURE_NAMES, default=DEFAULT_FEATURE_SET,
                           help=f"Router input schema (default: {DEFAULT_FEATURE_SET})")
     features.add_argument("--ablation", action="store_true", help="Compare all four input schemas on one snapshot")
+    ap.add_argument("--training-objective", choices=("supervised", "portfolio-risk", "portfolio-turnover", "all"),
+                    default="supervised", help="Opt in to the 58-input differentiable GMV experiments")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--yahoo-start", default="2014-01-01")
     ap.add_argument("--yahoo-end-exclusive", default="2026-11-12",
                     help="Fixed historical cutoff, exclusive. Do not include a partially traded U.S. day.")
     args = ap.parse_args()
+    if args.training_objective != "supervised" and (args.ablation or args.feature_set != DEFAULT_FEATURE_SET):
+        ap.error("The portfolio-aware experiments use expanded58 and include their own supervised feature comparison.")
     source_metadata = None
     if args.demo:
         csv_path = Path("data") / "synthetic_demo.csv"
@@ -560,7 +567,18 @@ def main():
     dates, samples, source_meta = _load_experiment(csv_path, args.demo, source_metadata)
     default_out = Path("results_synthetic" if args.demo else
                        "results_yahoo" if "yahoo_source_metadata" in source_meta else "results_csv")
-    if args.ablation:
+    if args.training_objective != "supervised":
+        try:
+            from train_portfolio_aware import run_portfolio_experiments
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"cvxpy", "cvxpylayers", "diffcp"}:
+                raise
+            ap.error(f"Portfolio training needs {exc.name}. Install requirements-portfolio.txt.")
+        suffix = "portfolio" if args.training_objective == "all" else args.training_objective.replace("-", "_")
+        run_portfolio_experiments(dates, samples, source_meta,
+                                  args.out or default_out.with_name(f"{default_out.name}_{suffix}"),
+                                  args.training_objective)
+    elif args.ablation:
         _run_ablation(dates, samples, args.out or default_out.with_name(default_out.name + "_ablation"), source_meta)
     else:
         _run_feature_set(dates, samples, args.out or default_out, source_meta, args.feature_set)

@@ -33,3 +33,22 @@ python run_poc.py --csv data/real_prices.csv --ablation
 ```
 
 `--ablation` runs all four feature sets on the same loaded snapshot. It writes a comparison CSV and metadata JSON at the output root, and the full backtest outputs in a subdirectory per feature set. The [feature-ablation report](experiments/feature_ablation_report.md) links to the archived comparison and configurations. Keep `yahoo_download_metadata.json` alongside the source CSV to retain its provenance when rerunning the study.
+
+## Portfolio-aware experiment
+
+Install the optional CVXPY dependencies in the PoC environment and opt in to the portfolio objectives. `cvxpylayers` 1.2 uses DIFFCP, which may build from source on Windows.
+
+```powershell
+python -m pip install -r requirements-portfolio.txt
+python -m unittest discover -s tests -v
+python run_poc.py --csv data/real_prices.csv --training-objective all --out results_portfolio_yahoo
+python paired_bootstrap.py results_portfolio_yahoo/test_daily_returns.csv --alternative "Portfolio-Aware MLP" --reference "Neural MLP"
+```
+
+`--training-objective supervised` is the default. `portfolio-risk` runs the 58-input risk-only model and the supervised comparisons. `portfolio-turnover` trains both portfolio objectives with the reference settings. `all` adds the seed, temperature, and diagonal jitter study and selects the risk-only configuration on validation with seed 42. It then fits the turnover model using that configuration and the pre-set penalty coefficient. The candidate seeds are 42, 13, and 73. Temperatures `.35` and `1.5` and jitter `1e-7` each change one setting from the `.75`, `1e-9` reference. The supervised tracks use the existing SLSQP and validation logic.
+
+The new MLP applies `softmax(-scores / temperature)` and blends the three covariance experts in PyTorch. The differentiable GMV layer symmetrises the mixture, adds daily-covariance jitter `j * I`, and applies the reference solver's `1e4` scale. For `L = cholesky(1e4 * (Sigma + j * I))`, the DPP-compliant CVXPY objective is `sum_squares(L.T @ w)`, with `sum(w) = 1` and `0 <= w <= 1`. CVXPYLayers uses Clarabel to solve and DIFFCP for the backward pass. A `1e-6` feasibility check precedes clipping tiny negative values and renormalising. The portfolio-aware backtest also uses this layer. [CVXPYLayers PyTorch API](https://cvxpylayers.org/api/torch.html) · [Solver documentation](https://cvxpylayers.org/guide/solvers.html)
+
+For weights `w` and subsequent simple sector returns `r`, day `k` wealth is `sum_i(w[i] * prod_{d<=k}(1 + r[d,i]))`. Daily portfolio return is wealth divided by preceding wealth minus one. Risk is `252 * 10,000 * mean(window sample variance)` in annualised percentage-points squared. The optional objective adds `25 * mean(one-way turnover)`, using half the sum of `sqrt(delta**2 + 1e-8) - 1e-4` for changes from the previous period's drifted allocation and turnover of one from initial cash. Each split is evaluated in chronological order, and the training epoch retains gradients across its adjacent windows. On holdout the common backtest charges 10 bps per unit of exact one-way turnover. The training loss uses gross within-window variance plus a turnover surrogate, while reported volatility uses the full net daily series.
+
+The comparison covers the supervised feature ablation (A), training objective and conventional baselines including Rule-Based (B), turnover (C), and configuration sensitivity (D). Each experiment writes its own metrics CSV with allocation and concentration summaries. The runner also saves aligned daily net returns, rebalance weights, validation configurations and epoch histories, numerical warnings, bootstrap results, and a Markdown comparison. The paired bootstrap uses 21-day moving blocks to reflect the holding interval, 10,000 resamples, and a pre-specified 10 bp annualised volatility reduction threshold. See the [archived portfolio study](experiments/portfolio_aware/README.md).
